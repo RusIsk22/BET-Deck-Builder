@@ -1,7 +1,7 @@
 """
 BET Deck Builder — FastAPI Build Service
 
-POST /build with outline JSON → returns .pptx file
+POST /build with outline JSON → builds .pptx → uploads to Supabase → returns download link.
 Deploy on Railway. Connect from Dify via HTTP Request node.
 """
 
@@ -9,9 +9,11 @@ import io
 import json
 import os
 import tempfile
+import uuid
+import httpx
 
 from fastapi import FastAPI, HTTPException, Header, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse
 from typing import Optional
 
 from build_deck import build
@@ -20,12 +22,15 @@ app = FastAPI(title="BET Deck Builder", version="1.0.0")
 
 TEMPLATE_PATH = os.path.join(os.path.dirname(__file__), "Master_Ergebnis.pptx")
 BUILD_SECRET = os.environ.get("BUILD_SECRET", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_BUCKET = "decks"
 
 
 def verify_secret(authorization: Optional[str]):
     """Simple bearer token auth."""
     if not BUILD_SECRET:
-        return  # No secret configured = no auth (dev mode)
+        return
     if not authorization:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     token = authorization.replace("Bearer ", "").strip()
@@ -33,9 +38,39 @@ def verify_secret(authorization: Optional[str]):
         raise HTTPException(status_code=403, detail="Invalid token")
 
 
+async def upload_to_supabase(pptx_bytes: bytes, filename: str) -> str:
+    """Upload .pptx to Supabase Storage and return public URL."""
+    unique_filename = f"{uuid.uuid4().hex[:8]}_{filename}"
+
+    upload_url = f"{SUPABASE_URL}/storage/v1/object/{SUPABASE_BUCKET}/{unique_filename}"
+
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            upload_url,
+            headers={
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            },
+            content=pptx_bytes,
+        )
+
+    if response.status_code not in [200, 201]:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Supabase upload failed: {response.status_code} - {response.text}"
+        )
+
+    public_url = f"{SUPABASE_URL}/storage/v1/object/public/{SUPABASE_BUCKET}/{unique_filename}"
+    return public_url
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "template_exists": os.path.exists(TEMPLATE_PATH)}
+    return {
+        "status": "ok",
+        "template_exists": os.path.exists(TEMPLATE_PATH),
+        "supabase_configured": bool(SUPABASE_URL and SUPABASE_KEY),
+    }
 
 
 @app.post("/build")
@@ -44,18 +79,7 @@ async def build_deck(
     authorization: Optional[str] = Header(None),
 ):
     """
-    Accepts outline JSON, builds .pptx, returns as download.
-    
-    Expects JSON body with structure:
-    {
-        "title": "...",
-        "subtitle": "...",
-        "footer": "...",
-        "slides": [...]
-    }
-    
-    Or wrapped in {"outline": "..."} or {"outline": {...}}
-    (for Dify compatibility).
+    Accepts outline JSON, builds .pptx, uploads to Supabase, returns download link.
     """
     verify_secret(authorization)
 
@@ -116,8 +140,14 @@ async def build_deck(
     )[:50].strip().replace(" ", "_")
     filename = f"{safe_title or 'deck'}.pptx"
 
-    return StreamingResponse(
-        io.BytesIO(pptx_bytes),
-        media_type="application/vnd.openxmlformats-officedocument.presentationml.presentation",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
+    # Upload to Supabase Storage
+    try:
+        download_url = await upload_to_supabase(pptx_bytes, filename)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    return JSONResponse(content={
+        "status": "success",
+        "filename": filename,
+        "download_url": download_url,
+    })
