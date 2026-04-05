@@ -136,8 +136,8 @@ async def build_deck(
 
     # Generate filename
     safe_title = "".join(
-        c if c.isalnum() or c in " -_" else "" for c in data["title"]
-    )[:50].strip().replace(" ", "_")
+        c if c.isascii() and (c.isalnum() or c in "-_") else "" for c in data["title"]
+    )[:50].strip() or "deck"
     filename = f"{safe_title or 'deck'}.pptx"
 
     # Upload to Supabase Storage
